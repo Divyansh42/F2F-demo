@@ -1,16 +1,30 @@
 apiVersion: tekton.dev/v1beta1
 kind: Pipeline
 metadata:
-  name: linter-pipeline
+  name: f2f-demo
 spec:
   workspaces:
     - name: shared-workspace
+    - name: json-workspace #workspace for the tokens file
+    - name: sonar-settings
+    - name: images-url
   params: 
-    - name: comments
-      type: string
     - name: gitrepositoryurl
       type: string
   tasks:
+  - name: cluster-provision
+    taskRef:
+      name: openshift-install
+    workspaces:
+      - name: output
+        workspace: shared-workspace
+    params:
+      - name: url
+        value: $(params.gitrepositoryurl)
+      - name: subdirectory
+        value: ""
+      - name: deleteExisting
+        value: "true"
   - name: fetch-repository
     taskRef:
       name: git-clone
@@ -24,43 +38,90 @@ spec:
         value: ""
       - name: deleteExisting
         value: "true"
-  - name: run-yaml-linter
-    conditions:
-    - conditionRef: check-comments
-      params:
-        - name: comments
-          value: $(params.comments)
-        - name: expected
-          value: "/yaml-lint"
+  - name: replace-secrets
     taskRef:
-      name: linter
+      name: replace-tokens
+    workspaces:
+      - name: source
+        workspace: shared-workspace
+      - name: token
+        workspace: json-workspace
+    params:
+      - name: inputFilePath
+        value: "./sample.yaml" # needs to be changed
+    runAfter:
+      - fetch-repository
+  - name: static-lint
+    taskRef:
+      name: sonarqube-scanner
+    workspaces:
+      - name: source-dir
+        workspace: shared-workspace
+      - name: sonar-settings
+        workspace: sonar-settings
+    params:
+      - name: SONAR_HOST_URL
+        value: $(params.gitrepositoryurl)
+      - name: SONAR_PROJECT_KEY
+        value: ""
+    runAfter:
+      - replace-secrets
+  - name: build-image
+    taskRef:
+      name: buildah
+    workspaces:
+      - name: source
+        workspace: shared-workspace
+    params:
+    - name: IMAGE
+      value: localhost:5000/nocode
+    - name: TLSVERIFY
+      value: "false"
+    runAfter:
+      - static-lint
+  - name: copy-image
+    taskRef:
+      name: skopeo-copy
+    workspaces:
+      - name: images-url
+        workspace: images-url
+    params:
+      - name: url
+        value: $(params.gitrepositoryurl)
+      - name: subdirectory
+        value: ""
+      - name: deleteExisting
+        value: "true"
+    runAfter:
+      - build-image
+  - name: deploy-app
+    taskRef:
+      name: blue-green-deploy
     workspaces:
       - name: output
         workspace: shared-workspace
     params:
-      - name: language
-        value: "yaml"
-      - name: filepath
-        value: "."
+      - name: url
+        value: $(params.gitrepositoryurl)
+      - name: subdirectory
+        value: ""
+      - name: deleteExisting
+        value: "true"
     runAfter:
-      - fetch-repository
-  - name: run-md-linter
-    conditions:
-    - conditionRef: check-comments
-      params:
-        - name: comments
-          value: $(params.comments)
-        - name: expected
-          value: "/md-lint"
+      - copy-image
+      - cluster-provision
+  - name: expose-svc
     taskRef:
-      name: linter
+      name: k8s-action
     workspaces:
       - name: output
         workspace: shared-workspace
     params:
-      - name: language
-        value: "mdlint"
-      - name: filepath
-        value: "."
+      - name: url
+        value: $(params.gitrepositoryurl)
+      - name: subdirectory
+        value: ""
+      - name: deleteExisting
+        value: "true"
     runAfter:
-      - fetch-repository
+      - deploy-app
